@@ -1,0 +1,679 @@
+# Script pra montar o relatorio de risco trabalhista
+# 1 - le a base bruta e aplica as regras (tira subcontrato, zera risco de alguns contratos)
+# 2 - joga os dados na tabela do template
+# 3 - atualiza as tabelas dinamicas
+# 4 - monta o resumo na aba RESUMO
+# tambem gera um excel de auditoria com tudo que foi tirado/zerado
+#
+# pip install pandas numpy openpyxl pywin32
+
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import win32com.client as win32
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+
+# ---------------- CONFIG ----------------
+
+PASTA = r"C:\caminho\para\pasta"
+
+ARQUIVO_BRUTO = os.path.join(PASTA, "Risco.xlsx")
+TEMPLATE = os.path.join(PASTA, "Template.xlsx")
+SAIDA_FINAL = os.path.join(PASTA, "Relatorio Final.xlsx")
+SAIDA_AUDITORIA = os.path.join(PASTA, "Auditoria.xlsx")
+
+ABA_DASHBOARD = "DASHBOARD GERAL DE RISCO"
+ABA_RESUMO = "RESUMO"
+NOME_TABELA = "Tabela1"
+
+LINHA_CABECALHO = 11
+LINHA_INICIAL = 12
+
+# datas das regras
+DATA_LIMITE_REGRA_A = pd.Timestamp("2025-11-30")
+DATA_PROPORCIONAL = pd.Timestamp("2026-01-01")  # a partir daqui usa o risco proporcional
+
+# ids dos contratos (colocar os ids reais aqui)
+
+# subcontratos que NAO devem ser removidos
+EXCECOES_SUB = [
+    "00000000-0000-0000-0000-000000000001",
+    "00000000-0000-0000-0000-000000000002",
+]
+
+# regra A: zera o risco ate a DATA_LIMITE_REGRA_A
+IDS_REGRA_A = [
+    "00000000-0000-0000-0000-000000000003",
+    "00000000-0000-0000-0000-000000000004",
+    "00000000-0000-0000-0000-000000000005",
+]
+
+# esses aqui tambem estao na regra A mas o motivo e diferente
+IDS_REGRA_A_PEDIDO_CLIENTE = [
+    "00000000-0000-0000-0000-000000000005",
+]
+
+# regra B: zera o risco sempre
+IDS_REGRA_B = [
+    "00000000-0000-0000-0000-000000000006",
+    "00000000-0000-0000-0000-000000000007",
+]
+
+COLUNAS_SAIDA = [
+    "Fornecedor", "Id_Contrato", "Razão Social", "CNPJ", "N° do pedido",
+    "Unidade", "Categoria", "Vigência na Competência", "Vigência de Contrato",
+    "Vigência Inicial", "Vigência Final", "Competência",
+    "Status de Prestação de Serviços", "Efetivos Ativos", "Efetivos FGTS Digital",
+    "Efetivos Analisados", "Percentual", "Valor da Folha", "Valor Contrato",
+    "FGTS Agendados", "FGTS Aprovados", "INSS Agendados", "INSS Aprovados",
+    "Salários Agendados", "Salários Aprovados", "Risco FGTS", "Risco INSS",
+    "Risco Salários", "Risco Total", "Risco Proporcional", "Risco Final",
+    "Motivo do Risco",
+]
+
+RISCOS = ["Risco FGTS", "Risco INSS", "Risco Salários"]
+
+MESES = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+         "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+
+MESES_CURTO = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+               "Jul", "Ago", "Set", "Out", "Nov", "Dez"]
+
+MOEDA = "R$ #.##0,00"
+
+# ----------------------------------------
+
+
+def cor(r, g, b):
+    # o excel usa a cor ao contrario (BGR)
+    return r + g * 256 + b * 65536
+
+
+AZUL_ESCURO = cor(14, 64, 86)
+AZUL_CLARO = cor(189, 215, 238)
+AZUL_LINHA = cor(0, 176, 240)
+AZUL_RISCO = cor(192, 230, 245)
+AMARELO = cor(255, 230, 153)
+BRANCO = cor(255, 255, 255)
+PRETO = cor(0, 0, 0)
+
+
+def nome_janela():
+    hoje = pd.Timestamp.today()
+    if hoje.day < 21:
+        janela = "Primeira Janela"
+    else:
+        janela = "Segunda Janela"
+    return janela + " - " + MESES[hoje.month] + "/" + str(hoje.year)
+
+
+def competencia_texto(data):
+    if pd.isna(data):
+        return ""
+    return MESES_CURTO[data.month] + "/" + str(data.year)
+
+
+def efetivos_analisados(qtd):
+    if qtd == 0:
+        return 0
+    if qtd <= 50:
+        return 10
+    if qtd <= 100:
+        return 15
+    if qtd <= 250:
+        return 20
+    if qtd <= 500:
+        return 25
+    if qtd <= 1000:
+        return 50
+    return 80
+
+
+def valor_excel(v):
+    # o win32 nao aceita NaN nem tipo do numpy
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except:
+        pass
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    if isinstance(v, np.generic):
+        return v.item()
+    return v
+
+
+def achar_tabela(ws):
+    for t in ws.ListObjects:
+        if t.Name == NOME_TABELA:
+            return t
+    raise Exception("Nao achei a tabela " + NOME_TABELA + " na aba " + ws.Name)
+
+
+def mapa_colunas(tabela):
+    mapa = {}
+    for i in range(1, tabela.ListColumns.Count + 1):
+        col = tabela.ListColumns(i)
+        mapa[str(col.Name).strip()] = col.Range.Column
+    return mapa
+
+
+def faixa(ws, l1, c1, l2, c2):
+    return ws.Range(ws.Cells(l1, c1), ws.Cells(l2, c2))
+
+
+def borda(rng, lado):
+    # lado 8 = em cima, 9 = embaixo
+    rng.Borders(lado).LineStyle = 1
+    rng.Borders(lado).Color = AZUL_LINHA
+    rng.Borders(lado).Weight = 2
+
+
+# ================= PARTE 1 - TRATAR A BASE =================
+
+def tratar_base():
+    print("\n[1/4] Lendo a base bruta...")
+
+    if not os.path.exists(ARQUIVO_BRUTO):
+        raise Exception("Arquivo bruto nao encontrado: " + ARQUIVO_BRUTO)
+
+    df = pd.read_excel(ARQUIVO_BRUTO, dtype={"N° do pedido": str})
+    linhas_recebidas = len(df)
+
+    obrigatorias = ["Competência", "N° do pedido", "Id_Contrato", "Motivo do Risco",
+                    "Efetivos Ativos", "Efetivos FGTS Digital"] + RISCOS
+    faltando = [c for c in obrigatorias if c not in df.columns]
+    if faltando:
+        raise Exception("Faltam colunas na base: " + ", ".join(faltando))
+
+    df["N° do pedido"] = df["N° do pedido"].fillna("").astype(str).str.strip()
+
+    # competencia vazia ou errada sai da base
+    comp_original = df["Competência"].copy()
+    df["Competência"] = pd.to_datetime(df["Competência"], errors="coerce")
+    sem_comp = df["Competência"].isna()
+    qtd_sem_comp = int(sem_comp.sum())
+
+    if qtd_sem_comp > 0:
+        print("\nAVISO: " + str(qtd_sem_comp) + " linha(s) sem Competência foram removidas")
+        cols = [c for c in ["Fornecedor", "Id_Contrato", "N° do pedido", "Unidade"] if c in df.columns]
+        ver = df.loc[sem_comp, cols].copy()
+        ver.insert(0, "Competência original", comp_original[sem_comp].values)
+        ver.insert(0, "Linha Excel", ver.index + 2)  # +2 por causa do cabecalho
+        print(ver.head(20).to_string(index=False))
+        df = df[~sem_comp].copy()
+
+    ids = df["Id_Contrato"].astype(str).str.upper()
+
+    # subcontratos: tira tudo que tem SUB no pedido, menos as excecoes
+    e_sub = df["N° do pedido"].str.contains("SUB", case=False, na=False)
+    e_excecao = ids.isin(EXCECOES_SUB)
+    remover = e_sub & ~e_excecao
+
+    qtd_sub = int(e_sub.sum())
+    qtd_sub_excecao = int((e_sub & e_excecao).sum())
+    qtd_sub_removido = int(remover.sum())
+
+    # guarda os removidos pra auditoria
+    sub_removidos = df[remover].copy()
+    for c in RISCOS:
+        sub_removidos[c] = pd.to_numeric(sub_removidos[c], errors="coerce").fillna(0)
+    sub_removidos["Risco Total"] = sub_removidos[RISCOS].sum(axis=1)
+
+    df = df[~remover].copy()
+    ids = df["Id_Contrato"].astype(str).str.upper()
+
+    # guarda o risco antes de zerar (pra auditoria)
+    riscos_antes = df[RISCOS].apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    # regra A
+    regra_a = (df["Competência"] <= DATA_LIMITE_REGRA_A) & ids.isin(IDS_REGRA_A)
+    df.loc[regra_a, RISCOS] = 0
+    df.loc[regra_a, "Motivo do Risco"] = "---"
+    df.loc[regra_a & ids.isin(IDS_REGRA_A_PEDIDO_CLIENTE), "Motivo do Risco"] = \
+        "Risco removido por solicitação do cliente"
+
+    # regra B
+    regra_b = ids.isin(IDS_REGRA_B)
+    df.loc[regra_b, RISCOS] = 0
+    df.loc[regra_b & df["Motivo do Risco"].isna(), "Motivo do Risco"] = "---"
+
+    # calculos
+    for c in ["Efetivos Ativos", "Efetivos FGTS Digital"] + RISCOS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    df["Efetivos Analisados"] = df["Efetivos Ativos"].apply(efetivos_analisados)
+
+    df["Percentual"] = np.where(df["Efetivos Ativos"] == 0, 0,
+                                df["Efetivos Analisados"] / df["Efetivos Ativos"])
+    df["Percentual"] = df["Percentual"].clip(0, 1)
+
+    df["Risco Total"] = df[RISCOS].sum(axis=1)
+
+    df["Risco Proporcional"] = np.where(df["Percentual"] == 0, df["Risco Total"],
+                                        df["Risco Total"] * df["Percentual"])
+
+    df["Risco Final"] = np.where(df["Competência"] >= DATA_PROPORCIONAL,
+                                 df["Risco Proporcional"], df["Risco Total"])
+
+    faltando = [c for c in COLUNAS_SAIDA if c not in df.columns]
+    if faltando:
+        raise Exception("Faltam colunas pro relatorio final: " + ", ".join(faltando))
+
+    # monta a auditoria com os valores de antes
+    partes = []
+    for mascara, nome in [(regra_a, "Neutralização - Regra A"), (regra_b, "Neutralização - Regra B")]:
+        if mascara.sum() == 0:
+            continue
+        linhas = df[mascara].copy()
+        linhas[RISCOS] = riscos_antes[mascara].values
+        linhas["Risco Total"] = riscos_antes[mascara].sum(axis=1).values
+        linhas.insert(0, "Regra Aplicada", nome)
+        partes.append(linhas)
+
+    if len(sub_removidos) > 0:
+        linhas = sub_removidos.reindex(columns=df.columns)
+        linhas.insert(0, "Regra Aplicada", "Subcontrato removido")
+        partes.append(linhas)
+
+    if partes:
+        auditoria = pd.concat(partes, ignore_index=True)
+    else:
+        auditoria = pd.DataFrame(columns=["Regra Aplicada"] + list(df.columns))
+
+    df = df.reset_index(drop=True)
+
+    resumo = {
+        "Linhas recebidas": linhas_recebidas,
+        "Linhas removidas sem Competência": qtd_sem_comp,
+        "Subcontratos encontrados": qtd_sub,
+        "Subcontratos removidos": qtd_sub_removido,
+        "Subcontratos mantidos por excecao": qtd_sub_excecao,
+        "Linhas zeradas - Regra A": int(regra_a.sum()),
+        "Linhas zeradas - Regra B": int(regra_b.sum()),
+        "Linhas na base final": len(df),
+    }
+
+    print("Base tratada: " + str(len(df)) + " linhas")
+    return df, resumo, auditoria
+
+
+def salvar_auditoria(auditoria):
+    print("\nSalvando a auditoria...")
+
+    if os.path.exists(SAIDA_AUDITORIA):
+        os.remove(SAIDA_AUDITORIA)
+
+    with pd.ExcelWriter(SAIDA_AUDITORIA, engine="openpyxl") as writer:
+        auditoria.to_excel(writer, index=False, sheet_name="Auditoria")
+        ws = writer.book["Auditoria"]
+
+        for cell in ws[1]:
+            cell.fill = PatternFill("solid", fgColor="0E4056")
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        colunas = {cell.value: cell.column for cell in ws[1]}
+        formatos = {
+            "Vigência Inicial": "dd/mm/yyyy",
+            "Vigência Final": "dd/mm/yyyy",
+            "Competência": "dd/mm/yyyy",
+            "Percentual": "0%",
+            "Efetivos Ativos": "0",
+            "Efetivos FGTS Digital": "0",
+            "N° do pedido": "@",
+        }
+        for nome, formato in formatos.items():
+            if nome in colunas:
+                for linha in range(2, ws.max_row + 1):
+                    ws.cell(linha, colunas[nome]).number_format = formato
+
+        # ajusta a largura das colunas
+        for col in range(1, ws.max_column + 1):
+            maior = 0
+            for linha in range(1, ws.max_row + 1):
+                v = ws.cell(linha, col).value
+                if v is not None:
+                    maior = max(maior, len(str(v)))
+            ws.column_dimensions[get_column_letter(col)].width = min(max(maior + 2, 12), 45)
+
+    print("Auditoria salva em " + SAIDA_AUDITORIA)
+    if len(auditoria) > 0:
+        print(auditoria["Regra Aplicada"].value_counts().to_string())
+
+
+# ================= PARTE 2 - PREENCHER A TABELA =================
+
+def preencher_dashboard(wb, df):
+    print("\n[2/4] Preenchendo a tabela...")
+
+    ws = wb.Worksheets(ABA_DASHBOARD)
+    tabela = achar_tabela(ws)
+    colunas = mapa_colunas(tabela)
+
+    # alguns templates antigos nao tem essa coluna, entao cria
+    if "Efetivos FGTS Digital" not in colunas:
+        print("Criando a coluna 'Efetivos FGTS Digital' no template")
+        pos = None
+        for i in range(1, tabela.ListColumns.Count + 1):
+            if str(tabela.ListColumns(i).Name).strip() == "Efetivos Ativos":
+                pos = i
+                break
+        if pos is None:
+            raise Exception("Nao achei a coluna 'Efetivos Ativos' na tabela")
+        nova = tabela.ListColumns.Add(Position=pos + 1)
+        nova.Name = "Efetivos FGTS Digital"
+        colunas = mapa_colunas(tabela)
+
+    faltando = [c for c in COLUNAS_SAIDA if c not in colunas]
+    if faltando:
+        raise Exception("Faltam colunas no template: " + ", ".join(faltando))
+
+    dados = df[COLUNAS_SAIDA].copy()
+    dados["N° do pedido"] = dados["N° do pedido"].fillna("").astype(str)
+    for c in ["Vigência Inicial", "Vigência Final", "Competência"]:
+        dados[c] = pd.to_datetime(dados[c], errors="coerce")
+
+    if len(dados) == 0:
+        raise Exception("A base ficou vazia")
+
+    # limpa o que tinha antes
+    try:
+        if tabela.DataBodyRange is not None:
+            tabela.DataBodyRange.ClearContents()
+    except:
+        pass
+
+    # aumenta/diminui a tabela pro tamanho certo
+    ultima_linha = LINHA_INICIAL + len(dados) - 1
+    col_ini = tabela.Range.Column
+    col_fim = col_ini + tabela.ListColumns.Count - 1
+    tabela.Resize(faixa(ws, LINHA_CABECALHO, col_ini, ultima_linha, col_fim))
+    colunas = mapa_colunas(tabela)
+
+    # pedido como texto senao o excel come os zeros
+    c = colunas["N° do pedido"]
+    faixa(ws, LINHA_INICIAL, c, ultima_linha, c).NumberFormat = "@"
+
+    # cola coluna por coluna (bem mais rapido que celula por celula)
+    for nome in COLUNAS_SAIDA:
+        c = colunas[nome]
+        valores = tuple((valor_excel(v),) for v in dados[nome].tolist())
+        faixa(ws, LINHA_INICIAL, c, ultima_linha, c).Value = valores
+
+    formatos = {
+        "Percentual": "0%",
+        "Efetivos Ativos": "0",
+        "Efetivos FGTS Digital": "0",
+        "Vigência Inicial": "dd/mm/aaaa",
+        "Vigência Final": "dd/mm/aaaa",
+        "Competência": "mm/aaaa",
+    }
+    for nome, formato in formatos.items():
+        c = colunas[nome]
+        faixa(ws, LINHA_INICIAL, c, ultima_linha, c).NumberFormatLocal = formato
+
+    print("Tabela preenchida ate a linha " + str(ultima_linha))
+
+
+# ================= PARTE 3 - PIVOTS =================
+
+def atualizar_pivots(excel, wb):
+    print("\n[3/4] Atualizando tabelas dinamicas...")
+    wb.RefreshAll()
+
+    for aba in wb.Worksheets:
+        try:
+            qtd = aba.PivotTables().Count
+            for i in range(1, qtd + 1):
+                p = aba.PivotTables(i)
+                print("  " + aba.Name + " - " + p.Name)
+                p.PivotCache().Refresh()
+                p.RefreshTable()
+        except Exception as e:
+            print("  Aviso em " + aba.Name + ": " + str(e))
+
+    try:
+        excel.CalculateUntilAsyncQueriesDone()
+    except:
+        pass
+    excel.CalculateFull()
+    excel.CalculateFullRebuild()
+
+
+# ================= PARTE 4 - RESUMO =================
+
+def criar_resumo(wb, df):
+    print("\n[4/4] Montando o resumo...")
+
+    ws = wb.Worksheets(ABA_RESUMO)
+
+    # cabecalho
+    c_min = df["Competência"].min()
+    c_max = df["Competência"].max()
+    if c_min.year == c_max.year and c_min.month == c_max.month:
+        ws.Range("D3").Value = competencia_texto(c_min)
+    else:
+        ws.Range("D3").Value = competencia_texto(c_min) + " a " + competencia_texto(c_max)
+    ws.Range("D4").Value = nome_janela()
+    ws.Range("D5").Value = pd.Timestamp.today().to_pydatetime()
+    ws.Range("D5").NumberFormatLocal = "dd/mm/aaaa"
+
+    achar_tabela(wb.Worksheets(ABA_DASHBOARD))  # so pra garantir que existe
+
+    # procura se a pivot ja existe
+    nome_pivot = "PivotResumoRisco"
+    pivot = None
+    try:
+        for i in range(1, ws.PivotTables().Count + 1):
+            if ws.PivotTables(i).Name == nome_pivot:
+                pivot = ws.PivotTables(i)
+                break
+    except:
+        pivot = None
+
+    cache = wb.PivotCaches().Create(SourceType=1, SourceData=NOME_TABELA)
+
+    if pivot is None:
+        try:
+            ws.Range("B27:D45").ClearContents()
+        except:
+            pass
+        pivot = cache.CreatePivotTable(TableDestination=ws.Range("B27"), TableName=nome_pivot)
+    else:
+        try:
+            pivot.ChangePivotCache(cache)
+        except:
+            pass
+        try:
+            pivot.ClearTable()
+        except:
+            pass
+
+    unidade = pivot.PivotFields("Unidade")
+    unidade.Orientation = 1  # linha
+    unidade.Position = 1
+    try:
+        unidade.Caption = "Distribuidora"
+    except:
+        pass
+
+    # -4157 = soma
+    campo_total = pivot.AddDataField(pivot.PivotFields("Risco Total"), "Soma de Risco Total**", -4157)
+    campo_final = pivot.AddDataField(pivot.PivotFields("Risco Final"), "Soma de Risco Final Acumulado***", -4157)
+
+    pivot.RowGrand = True
+    pivot.ColumnGrand = True
+    # essas configs as vezes dao erro dependendo da versao do excel
+    for config in ["ShowDrillIndicators", "PreserveFormatting", "HasAutoFormat"]:
+        try:
+            setattr(pivot, config, config == "PreserveFormatting")
+        except:
+            pass
+    try:
+        pivot.RowAxisLayout(1)
+    except:
+        pass
+    try:
+        unidade.ShowAllItems = False
+    except:
+        pass
+
+    pivot.PivotCache().Refresh()
+    pivot.RefreshTable()
+    try:
+        pivot.TableStyle2 = ""
+    except:
+        pass
+
+    for campo in [campo_total, campo_final]:
+        try:
+            campo.NumberFormat = MOEDA
+        except:
+            pass
+
+    # titulo
+    try:
+        ws.Range("B26:D26").UnMerge()
+    except:
+        pass
+    titulo = ws.Range("B26:D26")
+    titulo.Merge()
+    titulo.Value = "RESUMO"
+    titulo.Interior.Color = AZUL_ESCURO
+    titulo.Font.Color = BRANCO
+    titulo.Font.Bold = True
+    titulo.Font.Size = 11
+    titulo.HorizontalAlignment = -4108  # centro
+    titulo.VerticalAlignment = -4108
+    ws.Rows(26).RowHeight = 20
+
+    # posicao da pivot
+    r = pivot.TableRange2
+    l_cab = r.Row
+    l_total = r.Row + r.Rows.Count - 1
+    c_ini = r.Column
+    c_fim = r.Column + r.Columns.Count - 1
+
+    # cabecalho da pivot
+    cab = faixa(ws, l_cab, c_ini, l_cab, c_fim)
+    cab.Interior.Color = AZUL_CLARO
+    cab.Font.Color = PRETO
+    cab.Font.Bold = True
+    cab.Font.Size = 10
+    cab.VerticalAlignment = -4108
+    ws.Cells(l_cab, c_ini).HorizontalAlignment = -4131  # esquerda
+    if c_fim > c_ini:
+        faixa(ws, l_cab, c_ini + 1, l_cab, c_fim).HorizontalAlignment = -4108
+    borda(cab, 9)
+
+    # linhas do meio
+    for linha in range(l_cab + 1, l_total):
+        lin = faixa(ws, linha, c_ini, linha, c_fim)
+        lin.Interior.Color = BRANCO
+        lin.Font.Color = PRETO
+        lin.Font.Bold = True
+        ws.Cells(linha, c_ini).HorizontalAlignment = -4131
+        valores = faixa(ws, linha, c_ini + 1, linha, c_fim)
+        valores.HorizontalAlignment = -4152  # direita
+        valores.NumberFormatLocal = MOEDA
+        ws.Cells(linha, c_fim).Interior.Color = AZUL_RISCO
+        borda(lin, 9)
+
+    # linha do total geral
+    ws.Cells(l_total, c_ini).Interior.Color = AZUL_ESCURO
+    ws.Cells(l_total, c_ini).Font.Color = BRANCO
+    ws.Cells(l_total, c_ini).HorizontalAlignment = -4108
+    for col, fundo in [(c_ini + 1, AZUL_CLARO), (c_ini + 2, AMARELO)]:
+        cel = ws.Cells(l_total, col)
+        cel.Interior.Color = fundo
+        cel.Font.Color = PRETO
+        cel.HorizontalAlignment = -4152
+        cel.NumberFormatLocal = MOEDA
+    total = faixa(ws, l_total, c_ini, l_total, c_fim)
+    total.Font.Bold = True
+    borda(total, 8)
+    borda(total, 9)
+
+    ws.Columns("B").ColumnWidth = 38
+    ws.Columns("C").ColumnWidth = 23
+    ws.Columns("D").ColumnWidth = 29
+
+    # observacoes embaixo
+    ws.Range("B46:B48").ClearContents()
+    ws.Cells(46, 2).Value = "* Análise do Risco Acumulado caso utilizasse a metodologia proporcional desde o início do projeto."
+    ws.Cells(47, 2).Value = "** Soma do Risco sem levar em consideração qualquer critério de proporcionalidade."
+    ws.Cells(48, 2).Value = "*** Soma do Risco sem critério de proporcionalidade até Dez/25 e utilizando proporcionalidade após Jan/26."
+    ws.Range("B46:B48").Font.Size = 9
+
+    print("Resumo criado")
+
+
+# ================= MAIN =================
+
+def main():
+    print("=" * 60)
+    print("RELATORIO DE RISCO TRABALHISTA")
+    print("=" * 60)
+
+    if not os.path.exists(TEMPLATE):
+        raise Exception("Template nao encontrado: " + TEMPLATE)
+
+    df, resumo, auditoria = tratar_base()
+    salvar_auditoria(auditoria)
+
+    print("\nAbrindo o excel...")
+    excel = win32.DispatchEx("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    excel.ScreenUpdating = False
+
+    wb = None
+    try:
+        wb = excel.Workbooks.Open(os.path.abspath(TEMPLATE))
+
+        preencher_dashboard(wb, df)
+        atualizar_pivots(excel, wb)
+        criar_resumo(wb, df)
+
+        excel.CalculateFull()
+        excel.CalculateFullRebuild()
+
+        print("\nSalvando...")
+        saida = os.path.abspath(SAIDA_FINAL)
+        if os.path.exists(saida):
+            os.remove(saida)
+        wb.SaveAs(saida, FileFormat=51)  # 51 = xlsx
+
+        print("\n" + "=" * 60)
+        print("PRONTO!")
+        print("=" * 60)
+        for nome, qtd in resumo.items():
+            print(nome + ": " + str(qtd))
+        print("\nRelatorio: " + SAIDA_FINAL)
+        print("Auditoria: " + SAIDA_AUDITORIA)
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        except:
+            pass
+        try:
+            excel.Quit()
+        except:
+            pass
+
+
+if __name__ == "__main__":
+    main()
