@@ -1,0 +1,400 @@
+# Script pra automatizar o relatorio diario
+# 1 - pega o anexo do email que chega todo dia no outlook
+# 2 - salva na pasta e atualiza a planilha (power query)
+# 3 - abre um email pronto pra mandar pro pessoal (nao envia sozinho)
+#
+# precisa do outlook classico aberto (o novo outlook nao funciona com win32com)
+# pip install pywin32
+
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import unicodedata
+from datetime import date, datetime, timedelta
+
+import win32com.client as win32
+
+
+# ---------------- CONFIG (mudar aqui) ----------------
+
+REMETENTE = "Nome do Remetente"
+ASSUNTO = "Relatorio Diario"
+NOME_ARQUIVO = "Relatorio Diario"
+
+# pasta onde fica o arquivo que o power query le
+PASTA_RELATORIOS = r"C:\caminho\para\pasta\dos\relatorios"
+
+# planilha que vai ser atualizada
+PLANILHA = os.path.join(PASTA_RELATORIOS, "Acompanhamento.xlsm")
+ABA_DATA = "Tabelas de Acompanhamento"
+CELULA_DATA = "C2"
+
+# email que vai ser montado no final
+MONTAR_EMAIL = True
+PARA = [
+    "fulano@exemplo.com",
+    "ciclano@exemplo.com",
+]
+CC = ["beltrano@exemplo.com"]
+
+# tentativas de achar o email
+TENTATIVAS = 10
+ESPERA_ENTRE_TENTATIVAS = 60  # segundos
+ESPERA_OUTLOOK = 30  # tempo pro outlook baixar os emails depois de abrir
+
+# se nao achar o email de hoje, atualiza a planilha mesmo assim?
+ATUALIZAR_SEM_EMAIL = False
+
+MOSTRAR_EXCEL = False
+
+ARQUIVO_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log.txt")
+
+MESES = ["", "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+         "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
+
+# -----------------------------------------------------
+
+
+def log(texto):
+    linha = datetime.now().strftime("[%d/%m/%Y %H:%M:%S] ") + texto
+    print(linha)
+    try:
+        with open(ARQUIVO_LOG, "a", encoding="utf-8") as f:
+            f.write(linha + "\n")
+    except:
+        pass
+
+
+def limpar_texto(s):
+    # tira acento e deixa minusculo pra comparar
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.replace("’", "'").replace("´", "'")
+    return " ".join(s.lower().split())
+
+
+def nome_valido(nome):
+    for c in '\\/:*?"<>|':
+        nome = nome.replace(c, "-")
+    return nome.strip()
+
+
+def pasta_do_mes(data):
+    # ex: PASTA_RELATORIOS\2026\10 - Outubro\Base
+    mes = str(data.month).zfill(2) + " - " + MESES[data.month]
+    return os.path.join(PASTA_RELATORIOS, str(data.year), mes, "Base")
+
+
+# ---------- OUTLOOK ----------
+
+def outlook_aberto():
+    try:
+        saida = subprocess.check_output('tasklist /FI "IMAGENAME eq OUTLOOK.EXE"', shell=True, text=True)
+        return "OUTLOOK.EXE" in saida.upper()
+    except:
+        return False
+
+
+def achar_outlook_exe():
+    caminhos = []
+    # tenta pegar pelo registro primeiro
+    try:
+        import winreg
+        chave = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                               r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE")
+        valor, _ = winreg.QueryValueEx(chave, "")
+        caminhos.append(valor)
+    except:
+        pass
+    caminhos.append(r"C:\Program Files\Microsoft Office\root\Office16\OUTLOOK.EXE")
+    caminhos.append(r"C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE")
+
+    for c in caminhos:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def abrir_outlook():
+    if outlook_aberto():
+        log("Outlook ja esta aberto")
+    else:
+        exe = achar_outlook_exe()
+        if exe is None:
+            raise Exception("Nao achei o OUTLOOK.EXE, o outlook classico ta instalado?")
+        log("Abrindo o outlook...")
+        subprocess.Popen([exe])
+
+    # espera o outlook responder
+    for i in range(30):
+        try:
+            ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+            ns.GetDefaultFolder(6)
+            log("Outlook pronto")
+            try:
+                ns.SendAndReceive(False)
+            except:
+                pass
+            log("Esperando " + str(ESPERA_OUTLOOK) + "s pro outlook carregar os emails")
+            time.sleep(ESPERA_OUTLOOK)
+            return
+        except:
+            time.sleep(3)
+
+    raise Exception("O outlook nao abriu a tempo")
+
+
+def todas_pastas(pasta):
+    # pega a pasta e as subpastas
+    lista = [pasta]
+    try:
+        for p in pasta.Folders:
+            lista += todas_pastas(p)
+    except:
+        pass
+    return lista
+
+
+def baixar_anexo():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    inbox = ns.GetDefaultFolder(6)
+    hoje = date.today()
+
+    remetente = limpar_texto(REMETENTE)
+    assunto = limpar_texto(ASSUNTO)
+    salvos = []
+
+    for pasta in todas_pastas(inbox):
+        try:
+            emails = pasta.Items
+            emails.Sort("[ReceivedTime]", True)  # mais novo primeiro
+        except:
+            continue
+
+        cont = 0
+        for email in emails:
+            cont += 1
+            if cont > 500:
+                break
+            try:
+                recebido = email.ReceivedTime.replace(tzinfo=None)
+                if recebido.date() < hoje:
+                    break  # ja passou de hoje, nao precisa olhar o resto
+
+                if remetente not in limpar_texto(email.SenderName):
+                    continue
+                if assunto not in limpar_texto(email.Subject):
+                    continue
+
+                if email.Attachments.Count == 0:
+                    log("Achei o email mas ta sem anexo")
+                    return salvos
+
+                log("Email encontrado: " + email.Subject + " - " + str(recebido))
+                pasta_destino = pasta_do_mes(recebido)
+                os.makedirs(pasta_destino, exist_ok=True)
+
+                for i in range(1, email.Attachments.Count + 1):
+                    anexo = email.Attachments.Item(i)
+                    ext = os.path.splitext(anexo.FileName)[1]
+
+                    # salva uma copia com a data
+                    nome = nome_valido(NOME_ARQUIVO + " " + recebido.strftime("%d.%m.%Y") + ext)
+                    caminho = os.path.join(pasta_destino, nome)
+                    anexo.SaveAsFile(caminho)
+                    salvos.append(caminho)
+                    log("Anexo salvo em " + caminho)
+
+                    # e outra sem data, que e a que o power query le
+                    shutil.copy2(caminho, os.path.join(PASTA_RELATORIOS, nome_valido(NOME_ARQUIVO + ext)))
+
+                return salvos
+            except Exception as e:
+                log("Erro lendo email, pulando: " + str(e))
+
+    return salvos
+
+
+def procurar_email():
+    for t in range(1, TENTATIVAS + 1):
+        arquivos = baixar_anexo()
+        if arquivos:
+            return arquivos
+        if t < TENTATIVAS:
+            log("Email de hoje ainda nao chegou (tentativa " + str(t) + "/" + str(TENTATIVAS) + ")")
+            try:
+                win32.Dispatch("Outlook.Application").GetNamespace("MAPI").SendAndReceive(False)
+            except:
+                pass
+            time.sleep(ESPERA_ENTRE_TENTATIVAS)
+    log("Desisti, o email de hoje nao apareceu")
+    return []
+
+
+# ---------- EXCEL ----------
+
+# codigos de erro que o excel da quando ta ocupado
+ERROS_OCUPADO = [-2147418111, -2147417846, -2146777998]
+
+
+def tentar(funcao, nome):
+    # o excel as vezes recusa a chamada quando ta ocupado, entao tenta de novo
+    for t in range(6):
+        try:
+            return funcao()
+        except Exception as e:
+            codigo = getattr(e, "hresult", None)
+            if codigo is None and e.args and isinstance(e.args[0], int):
+                codigo = e.args[0]
+            if codigo not in ERROS_OCUPADO or t == 5:
+                raise
+            log("Excel ocupado ao " + nome + ", tentando de novo em 10s")
+            time.sleep(10)
+
+
+def esperar_refresh(wb):
+    inicio = time.time()
+    while time.time() - inicio < 300:
+        rodando = False
+        try:
+            for con in wb.Connections:
+                try:
+                    if con.OLEDBConnection.Refreshing:
+                        rodando = True
+                except:
+                    pass
+        except:
+            rodando = True  # se deu erro provavelmente ta ocupado ainda
+        if not rodando:
+            return
+        time.sleep(2)
+    log("Demorou demais o refresh, seguindo assim mesmo")
+
+
+def atualizar_planilha():
+    if not os.path.isfile(PLANILHA):
+        raise Exception("Planilha nao encontrada: " + PLANILHA)
+
+    excel = tentar(lambda: win32.DispatchEx("Excel.Application"), "abrir o excel")
+    excel.Visible = MOSTRAR_EXCEL
+    excel.DisplayAlerts = False
+    try:
+        excel.AutomationSecurity = 3  # desativa as macros pra nao travar no aviso
+    except:
+        pass
+
+    wb = None
+    try:
+        log("Abrindo planilha")
+        wb = tentar(lambda: excel.Workbooks.Open(PLANILHA, UpdateLinks=0, ReadOnly=False), "abrir a planilha")
+
+        if wb.ReadOnly:
+            raise Exception("Planilha abriu como somente leitura, alguem ta com ela aberta?")
+
+        # desliga o refresh em segundo plano pra o RefreshAll esperar terminar
+        for con in wb.Connections:
+            try:
+                con.OLEDBConnection.BackgroundQuery = False
+            except:
+                pass
+
+        log("Atualizando power query...")
+        tentar(lambda: wb.RefreshAll(), "atualizar")
+        esperar_refresh(wb)
+        try:
+            excel.CalculateUntilAsyncQueriesDone()
+        except:
+            pass
+
+        log("Atualizando tabelas dinamicas...")
+        for aba in wb.Worksheets:
+            try:
+                for tabela in aba.PivotTables():
+                    tabela.RefreshTable()
+            except:
+                pass
+
+        # coloca a data de hoje no cabecalho
+        # (o excel conta os dias a partir de 30/12/1899)
+        serial = (date.today() - date(1899, 12, 30)).days
+        try:
+            wb.Worksheets(ABA_DATA).Range(CELULA_DATA).Value = serial
+        except Exception as e:
+            log("Nao consegui colocar a data: " + str(e))
+
+        tentar(lambda: wb.Save(), "salvar")
+        log("Planilha salva!")
+    finally:
+        if wb is not None:
+            try:
+                wb.Close(SaveChanges=False)
+            except:
+                pass
+        try:
+            excel.Quit()
+        except:
+            pass
+
+
+# ---------- EMAIL ----------
+
+def montar_email():
+    hoje = date.today()
+
+    # dados vao ate ontem, mas se for segunda volta pra sexta
+    ontem = hoje - timedelta(days=1)
+    while ontem.weekday() >= 5:
+        ontem -= timedelta(days=1)
+
+    # copia a planilha pro temp com a data no nome pra mandar no anexo
+    ext = os.path.splitext(PLANILHA)[1]
+    nome_anexo = "Acompanhamento " + hoje.strftime("%d.%m") + ext
+    anexo = os.path.join(tempfile.gettempdir(), nome_anexo)
+    shutil.copy2(PLANILHA, anexo)
+
+    outlook = win32.Dispatch("Outlook.Application")
+    email = outlook.CreateItem(0)
+    email.To = "; ".join(PARA)
+    email.CC = "; ".join(CC)
+    email.Subject = "Relatório de Acompanhamento - " + MESES[hoje.month]
+    email.Body = ("Bom dia,\r\n\r\n"
+                  "Segue o relatório atualizado até " + ontem.strftime("%d/%m") + ".")
+    email.Attachments.Add(anexo)
+    email.Display()  # so abre, quem envia sou eu
+    log("Email aberto pra conferir")
+
+
+# ---------- MAIN ----------
+
+if __name__ == "__main__":
+    log("===== INICIO =====")
+
+    arquivos = []
+    try:
+        abrir_outlook()
+        arquivos = procurar_email()
+    except Exception as e:
+        log("Erro no outlook: " + str(e))
+
+    planilha_ok = False
+    if arquivos or ATUALIZAR_SEM_EMAIL:
+        try:
+            time.sleep(10)  # da um tempo antes de abrir o excel senao ele reclama
+            atualizar_planilha()
+            planilha_ok = True
+        except Exception as e:
+            log("Erro no excel: " + str(e))
+    else:
+        log("Sem o email de hoje, nao vou atualizar a planilha")
+
+    if planilha_ok and MONTAR_EMAIL:
+        try:
+            montar_email()
+        except Exception as e:
+            log("Erro montando email: " + str(e))
+
+    log("===== FIM =====\n")
