@@ -1,0 +1,204 @@
+
+
+import argparse
+import os
+import re
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
+
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+
+# ---------------- CONFIG ----------------
+
+PASTA_PDFS = r"C:\caminho\para\pasta\dos\pdfs"
+ARQUIVO_SAIDA = r"C:\caminho\para\Certidoes.xlsx"
+
+NOME_ABA = "Certidoes"
+NOME_TABELA = "tbl_cnds"
+
+# coluna: largura
+COLUNAS = {
+    "Nome da Empresa": 40,
+    "CNPJ": 22,
+    "CNPJ_Raiz": 12,
+    "Emissao": 14,
+    "Validade": 14,
+    "Status Certidao": 32,
+    "Status Validade": 18,
+}
+
+# ----------------------------------------
+
+
+# regex pra achar cada campo no texto do pdf
+RE_NOME = re.compile(r"^Nome:\s*(.+)$", re.I | re.M)
+RE_CNPJ = re.compile(r"^CNPJ:\s*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", re.I | re.M)
+RE_EMISSAO = re.compile(r"^Emitida às \d{2}:\d{2}:\d{2} do dia (\d{2}/\d{2}/\d{4})", re.I | re.M)
+RE_VALIDADE = re.compile(r"^Válida até\s+(\d{2}/\d{2}/\d{4})\.", re.I | re.M)
+RE_STATUS = re.compile(
+    r"CERTIDÃO\s+(POSITIVA COM EFEITOS DE NEGATIVA|NEGATIVA|POSITIVA)\s+DE DÉBITOS RELATIVOS", re.I)
+
+
+def procurar(regex, texto):
+    achou = regex.search(texto)
+    if achou:
+        return achou.group(1).strip()
+    return ""
+
+
+def cnpj_raiz(cnpj):
+    # pega so os 8 primeiros numeros. ex: 12.345.678/
+    numeros = re.sub(r"\D", "", cnpj)
+    if len(numeros) < 8:
+        return ""
+    return numeros[0:2] + "." + numeros[2:5] + "." + numeros[5:8] + "/"
+
+
+def status_certidao(texto):
+    status = procurar(RE_STATUS, texto).upper()
+    if status == "POSITIVA COM EFEITOS DE NEGATIVA":
+        return "Positiva com efeitos de Negativa"
+    if status == "NEGATIVA":
+        return "Negativa"
+    if status == "POSITIVA":
+        return "Positiva"
+    return ""
+
+
+def status_validade(validade):
+    try:
+        data = datetime.strptime(validade, "%d/%m/%Y").date()
+    except:
+        return "Sem Data"
+    if data < date.today():
+        return "Vencida"
+    return "Regular"
+
+
+def ler_pdf(caminho):
+    linha = {"_Arquivo": os.path.basename(caminho)}
+    try:
+        # os pdfs so tem 1 pagina entao le so a primeira
+        with pdfplumber.open(caminho) as pdf:
+            if len(pdf.pages) > 0:
+                texto = pdf.pages[0].extract_text() or ""
+            else:
+                texto = ""
+
+        cnpj = procurar(RE_CNPJ, texto)
+        validade = procurar(RE_VALIDADE, texto)
+
+        linha["Nome da Empresa"] = procurar(RE_NOME, texto)
+        linha["CNPJ"] = cnpj
+        linha["CNPJ_Raiz"] = cnpj_raiz(cnpj)
+        linha["Emissao"] = procurar(RE_EMISSAO, texto)
+        linha["Validade"] = validade
+        linha["Status Certidao"] = status_certidao(texto)
+        linha["Status Validade"] = status_validade(validade)
+    except Exception as e:
+        print("Erro no arquivo " + caminho + ": " + str(e))
+        linha["Status Validade"] = "Erro: " + str(e)
+    return linha
+
+
+def listar_pdfs(entrada):
+    if os.path.isfile(entrada) and entrada.lower().endswith(".pdf"):
+        return [entrada]
+    pdfs = []
+    for pasta, _, arquivos in os.walk(entrada):
+        for arq in arquivos:
+            if arq.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(pasta, arq))
+    return sorted(pdfs)
+
+
+def mesmo_mes(caminho):
+    # ve se o arquivo/pasta foi modificado esse mes
+    modificado = datetime.fromtimestamp(os.path.getmtime(caminho))
+    hoje = date.today()
+    return modificado.year == hoje.year and modificado.month == hoje.month
+
+
+def salvar_excel(linhas, colunas, saida, banner=None):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = NOME_ABA
+
+    # se tiver banner o cabecalho desce pra linha 2
+    linha_cab = 1
+    if banner:
+        linha_cab = 2
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(colunas))
+        ws.cell(1, 1, banner).font = Font(bold=True)
+        ws.cell(1, 1).alignment = Alignment(horizontal="center", vertical="center")
+
+    for i, nome in enumerate(colunas):
+        ws.cell(linha_cab, i + 1, nome)
+        ws.column_dimensions[get_column_letter(i + 1)].width = COLUNAS.get(nome, 30)
+
+    for n, dados in enumerate(linhas):
+        for i, nome in enumerate(colunas):
+            ws.cell(linha_cab + 1 + n, i + 1, dados.get(nome, ""))
+
+    ws.freeze_panes = "A" + str(linha_cab + 1)
+
+    # transforma em tabela do excel
+    if len(linhas) > 0:
+        ultima = get_column_letter(len(colunas)) + str(linha_cab + len(linhas))
+        tabela = Table(displayName=NOME_TABELA, ref="A" + str(linha_cab) + ":" + ultima)
+        tabela.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+        ws.add_table(tabela)
+
+    os.makedirs(os.path.dirname(os.path.abspath(saida)), exist_ok=True)
+    wb.save(saida)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Extrai os dados das certidoes em PDF pra um excel")
+    parser.add_argument("entrada", nargs="?", default=PASTA_PDFS, help="PDF ou pasta com PDFs")
+    parser.add_argument("-o", "--out", default=ARQUIVO_SAIDA, help="excel de saida")
+    parser.add_argument("--banner", help="texto na primeira linha")
+    parser.add_argument("--debug", action="store_true", help="adiciona a coluna _Arquivo")
+    args = parser.parse_args()
+
+    entrada = os.path.abspath(args.entrada)
+    saida = os.path.abspath(args.out)
+
+    if not os.path.exists(entrada):
+        sys.exit("Nao achei a entrada: " + entrada)
+
+    # so roda se a pasta mudou esse mes e o excel ainda nao foi gerado esse mes
+    pasta = entrada if os.path.isdir(entrada) else os.path.dirname(entrada)
+    if not mesmo_mes(pasta):
+        print("A pasta nao foi atualizada esse mes, nao vou rodar")
+        return
+    if os.path.exists(saida) and mesmo_mes(saida):
+        print("O excel ja foi gerado esse mes, nao vou rodar")
+        return
+
+    pdfs = listar_pdfs(entrada)
+    if not pdfs:
+        sys.exit("Nenhum PDF encontrado")
+
+    print("Lendo " + str(len(pdfs)) + " PDF(s)...")
+    # usa threads pra ir mais rapido quando tem muito pdf (o map mantem a ordem)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        linhas = list(ex.map(ler_pdf, pdfs))
+
+    colunas = list(COLUNAS.keys())
+    if args.debug:
+        colunas.append("_Arquivo")
+
+    salvar_excel(linhas, colunas, saida, args.banner)
+    print("Excel gerado em " + saida)
+    print("Linhas: " + str(len(linhas)))
+
+
+if __name__ == "__main__":
+    main()
